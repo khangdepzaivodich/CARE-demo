@@ -445,4 +445,3 @@ def draw_pdf_str_attr(message, ano_label, str_ano_label, attr_ano_label, dataset
         plt.show()
 
 
-
