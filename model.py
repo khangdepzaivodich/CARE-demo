@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.metrics import average_precision_score, roc_auc_score
 from utils import *
+from sklearn.metrics import average_precision_score, roc_auc_score
 
-# =========================================================
-# 1. DIFF POOLING BLOCK (Modified for Evidential)
-# =========================================================
+# =================================================================
+# 1. DIFF POOLING BLOCK (SỬA ĐỔI CHO EVIDENTIAL LEARNING)
+# =================================================================
 class DiffPoolingBlock(torch.nn.Module):
     def __init__(self, in_dim, n_clusters, tau=2, dim=-1, n_layer=1):
         super().__init__()
@@ -15,50 +15,44 @@ class DiffPoolingBlock(torch.nn.Module):
         for i in range(n_layer-1):
             self.linear.append(nn.Linear(n_clusters, n_clusters))
         
-        # [S²E CHANGE] Thay Softmax bằng Softplus để tính Evidence (e >= 0)
-        self.activation_head = nn.Softplus() 
+        # [S²E CHANGE] Thay Softmax bằng Softplus để tạo Evidence không âm
+        self.activation_head = nn.Softplus()
         
         self.activation = nn.ReLU()
         self.tau = tau
         self.dim = dim
-
-    def reset_parameters(self):
-        for layer in self.linear:
-            layer.reset_parameters()
 
     def forward(self, h, adj):
         out = h
         for i in range(len(self.linear)):
             out = self.activation(torch.mm(adj, self.linear[i](out)) + 1e-15)
         
-        # [S²E CHANGE] Output là Alpha = Evidence + 1
+        # [S²E CHANGE] Trả về Alpha (Dirichlet parameters) thay vì xác suất
         evidence = self.activation_head(out)
         alpha = evidence + 1
         return alpha
 
-# =========================================================
-# 2. BASIC GCN & READOUT (Giữ nguyên)
-# =========================================================
+
+# =================================================================
+# 2. STANDARD GCN & READOUTS (GIỮ NGUYÊN TỪ CARE)
+# =================================================================
 class GCN(nn.Module):
     def __init__(self, in_ft, out_ft, act, bias=True):
         super(GCN, self).__init__()
         self.fc = nn.Linear(in_ft, out_ft, bias=False)
         self.act = nn.PReLU() if act == 'prelu' else act
-
         if bias:
             self.bias = nn.Parameter(torch.FloatTensor(out_ft))
             self.bias.data.fill_(0.0)
         else:
             self.register_parameter('bias', None)
-
         for m in self.modules():
             self.weights_init(m)
 
     def weights_init(self, m):
         if isinstance(m, nn.Linear):
             torch.nn.init.xavier_uniform_(m.weight.data)
-            if m.bias is not None:
-                m.bias.data.fill_(0.0)
+            if m.bias is not None: m.bias.data.fill_(0.0)
 
     def forward(self, seq, adj, sparse=False):
         seq_fts = self.fc(seq)
@@ -66,31 +60,23 @@ class GCN(nn.Module):
             out = torch.unsqueeze(torch.spmm(adj, torch.squeeze(seq, 0)), 0)
         else:
             out = torch.mm(adj, seq_fts)
-        if self.bias is not None:
-            out += self.bias
+        if self.bias is not None: out += self.bias
         return self.act(out)
 
 class AvgReadout(nn.Module):
-    def __init__(self):
-        super(AvgReadout, self).__init__()
-    def forward(self, seq):
-        return torch.mean(seq, 1)
+    def __init__(self): super(AvgReadout, self).__init__()
+    def forward(self, seq): return torch.mean(seq, 1)
 
 class MaxReadout(nn.Module):
-    def __init__(self):
-        super(MaxReadout, self).__init__()
-    def forward(self, seq):
-        return torch.max(seq, 1).values
+    def __init__(self): super(MaxReadout, self).__init__()
+    def forward(self, seq): return torch.max(seq, 1).values
 
 class MinReadout(nn.Module):
-    def __init__(self):
-        super(MinReadout, self).__init__()
-    def forward(self, seq):
-        return torch.min(seq, 1).values
+    def __init__(self): super(MinReadout, self).__init__()
+    def forward(self, seq): return torch.min(seq, 1).values
 
 class WSReadout(nn.Module):
-    def __init__(self):
-        super(WSReadout, self).__init__()
+    def __init__(self): super(WSReadout, self).__init__()
     def forward(self, seq, query):
         query = query.permute(0, 2, 1)
         sim = torch.matmul(seq, query)
@@ -100,9 +86,10 @@ class WSReadout(nn.Module):
         out = torch.sum(out, 1)
         return out
 
-# =========================================================
-# 3. MAIN S²E-CARE MODEL (Core Logic Updated)
-# =========================================================
+
+# =================================================================
+# 3. S²E-CARE MODEL (LOGIC CHÍNH)
+# =================================================================
 class Model(nn.Module):
     def __init__(self, n_in, n_h, activation, readout, config):
         super(Model, self).__init__()
@@ -112,53 +99,44 @@ class Model(nn.Module):
         self.act = nn.PReLU()
         self.fc1 = nn.Linear(n_h, 2 * n_h, bias=False)
         
-        # DiffPool trả về Alpha (Dirichlet) thay vì Softmax
+        # [S²E] DiffPool trả về Alpha
         self.diffpool = DiffPoolingBlock(n_in, n_clusters=config['clusters'], dim=-1)
         
         self.ReLU = nn.ReLU()
-        if readout == 'max':
-            self.read = MaxReadout()
-        elif readout == 'min':
-            self.read = MinReadout()
-        elif readout == 'avg':
-            self.read = AvgReadout()
-        elif readout == 'weighted_sum':
-            self.read = WSReadout()
+        if readout == 'max': self.read = MaxReadout()
+        elif readout == 'min': self.read = MinReadout()
+        elif readout == 'avg': self.read = AvgReadout()
+        elif readout == 'weighted_sum': self.read = WSReadout()
             
         self.tau = 1
         self.lamb = config['lamb']
-        self.alpha_coeff = config['alpha'] # Đổi tên để tránh nhầm với tham số Dirichlet
+        self.alpha_coeff = config['alpha'] # Đổi tên để tránh trùng với tham số Dirichlet alpha
         self.beta = config['beta']
         self.norm = config['norm']
         self.n_clusters = config['clusters']
 
-    # --- [S²E-CARE Step 2] Evidential Helpers ---
+    # --- HELPER: EVIDENTIAL LOSS & UNCERTAINTY ---
     def calc_uncertainty(self, alpha):
-        """Tính độ không chắc chắn: u = K / sum(alpha)"""
         S = torch.sum(alpha, dim=1, keepdim=True)
-        uncertainty = self.n_clusters / S
-        return uncertainty
+        return self.n_clusters / S
 
     def evidential_loss(self, alpha, pseudo_labels):
-        """Hàm Loss Bayes Risk + KL Divergence"""
+        """Hàm Loss đặc trưng của S²E-CARE"""
         S = torch.sum(alpha, dim=1, keepdim=True)
-        # One-hot encoding nhãn giả
         y = F.one_hot(pseudo_labels, num_classes=self.n_clusters).float()
         
-        # 1. Prediction Error (Risk)
+        # Bayes Risk (MSE)
         prob = alpha / S
-        mse = (y - prob) ** 2
-        loss_risk = torch.sum(mse, dim=1)
+        loss_risk = torch.sum((y - prob) ** 2, dim=1)
         
-        # 2. KL Divergence Regularization
-        # Ép các mẫu về phân phối Uniform Dirichlet để tránh Overconfidence
+        # KL Divergence Regularization
         alpha_tilde = y + (1 - y) * alpha
         var_term = torch.lgamma(torch.sum(alpha_tilde, dim=1)) - \
                    torch.lgamma(torch.sum(torch.ones_like(alpha), dim=1)) - \
                    torch.sum(torch.lgamma(alpha_tilde), dim=1) + \
                    torch.sum(torch.lgamma(torch.ones_like(alpha)), dim=1)
                    
-        return torch.mean(loss_risk + 0.01 * var_term) # 0.01 là lambda regularization
+        return torch.mean(loss_risk + 0.01 * var_term)
 
     def normalize_adj_tensor(self, adj):
         row_sum = torch.sum(adj, 0)
@@ -168,6 +146,7 @@ class Model(nn.Module):
         adj = torch.mm(torch.diag_embed(r_inv), adj)
         return adj
 
+    # --- FORWARD PASS ---
     def forward(self, seq, adj, raw_adj, adj2=None, raw_adj2=None, sparse=False):
         # 1. GCN Encoder
         if adj2 is not None:
@@ -180,55 +159,58 @@ class Model(nn.Module):
             s_adj = adj[0]
             raw_adj2 = raw_adj
 
-        # 2. [S²E] Evidential Clustering
-        # assign bây giờ là tham số Alpha (không phải xác suất softmax)
+        # 2. Evidential Clustering (DiffPool)
+        # Output là Alpha (Dirichlet parameters)
         alpha = self.diffpool(seq, s_adj)
-        self.G = alpha
         
-        # Chuyển đổi Alpha sang xác suất (Expected Probability) để dùng cho các loss cũ của CARE
+        # Chuyển Alpha về Probability để dùng cho các loss cũ của CARE
         S = torch.sum(alpha, dim=1, keepdim=True)
-        prob_assign = alpha / S  # E[p] = alpha / S
+        prob_assign = alpha / S # Expected Probability
         
-        # 3. Tính Loss
+        # 3. Tính toán các Loss thành phần
         raw_adj = (raw_adj[0] + raw_adj2[0])/2
         
-        # Contrastive Loss (Vẫn dùng probability)
+        # a) Graph Contrastive Loss (Dùng Prob) - Đã có Nystrom Sampling bên trong
         con_loss = self.graph_contrastive_loss(feat, feat, prob_assign, raw_adj)
         
-        # Cluster Affinity (Dùng Probability)
+        # b) Cluster Affinity Loss
         cluster_sim = self.alpha_coeff * torch.mm(prob_assign, prob_assign.T) + raw_adj * (1 - self.alpha_coeff)
         if self.norm:
             cluster_sim = self.normalize_adj_tensor(cluster_sim)
-            
-        if adj2 is None:
-            view_consistency = 0
-        else:
-            view_consistency = torch.norm(feat1 - feat2, dim=1, p=2).mean()
-
-        # Max Message Passing Loss
-        loss_msg, message_sum1 = self.max_message(feat, cluster_sim)
         
-        # [S²E] Evidential Loss
-        # Dùng argmax của alpha làm nhãn giả để tự giám sát
+        # c) View Consistency
+        if adj2 is None: view_consistency = 0
+        else: view_consistency = torch.norm(feat1 - feat2, dim=1, p=2).mean()
+        
+        # d) Max Message Loss (CARE gốc)
+        loss_msg, _ = self.max_message(feat, cluster_sim)
+        
+        # e) [S²E NEW] Evidential Loss
+        # Tự giám sát bằng nhãn giả tự tin nhất
         with torch.no_grad():
             pseudo_labels = torch.argmax(alpha, dim=1)
         loss_edl = self.evidential_loss(alpha, pseudo_labels)
 
+        # f) Regularization
         fc1 = self.fc1(feat)
-        reg_loss = 0
+        loss_reg = 0
         if self.beta != 0:
-            reg_loss = self.beta * self.reg_edge(fc1, adj[0])
+            loss_reg = self.beta * self.reg_edge(fc1, adj[0])
             
-        # Tổng hợp Loss: Cũ + Evidential
-        total_loss = loss_msg + self.lamb * (con_loss + view_consistency) + reg_loss + 0.1 * loss_edl
-        
-        # Trả về alpha để dùng cho inference
+        # Tổng hợp Loss
+        total_loss = loss_msg + \
+                     self.lamb * (con_loss + view_consistency) + \
+                     loss_reg + \
+                     0.1 * loss_edl # Thêm trọng số cho EDL
+                     
+        # Quan trọng: Trả về 4 giá trị để khớp với main.py mới
         return feat, cluster_sim, total_loss, alpha
 
+    # --- NYSTRÖM APPROXIMATION LOSS ---
     def graph_contrastive_loss(self, v1, v2, assignment, adj, test_phase=False):
-        # Nyström Approximation (Implicit via Sampling)
+        # Lấy mẫu ngẫu nhiên (Sampling) để giảm độ phức tạp từ O(N^2) -> O(Nm)
         if v1.shape[0] > 10000 and not test_phase:
-            idx = torch.randperm(v1.shape[0])[:5000] # Sample landmarks
+            idx = torch.randperm(v1.shape[0])[:5000] # Landmarks
         else:
             idx = torch.arange(v1.shape[0])
             
@@ -239,16 +221,10 @@ class Model(nn.Module):
         sim = self.cosine_sim(v, v, self.tau)
         O = self.alpha_coeff * torch.matmul(assignment, assignment.T) + (1 - self.alpha_coeff) * adj
         
-        # Normalize O to avoid explosion
-        loss = torch.norm(O / O.sum(dim=1, keepdim=True).clamp_min(0.01) - sim, 2, dim=1).mean()
+        # Tránh lỗi chia cho 0
+        O_sum = O.sum(dim=1, keepdim=True).clamp(min=1e-6)
+        loss = torch.norm(O / O_sum - sim, 2, dim=1).mean()
         return loss
-
-    def view_consistency(self, seq, adj, adj2, sparse=False):
-        if adj2 is None: return 0
-        feat1 = self.gcn2(self.gcn1(seq, adj[0]), adj[0])
-        feat2 = self.gcn2(self.gcn1(seq, adj2[0]), adj2[0])
-        view_consistency = torch.norm(feat1 - feat2, dim=1, p=2)
-        return view_consistency * self.lamb
 
     def cosine_sim(self, x1, x2, eps=1e-15, temperature=1):
         w1 = x1.norm(p=2, dim=1, keepdim=True)
@@ -281,33 +257,23 @@ class Model(nn.Module):
         message = message * r_inv
         return - torch.sum(message), message
 
-    # --- [S²E-CARE] Inference với Uncertainty ---
+    # --- S²E-CARE INFERENCE ---
     def inference(self, feature, alpha):
-        # 1. Reconstruction-like score (từ CARE gốc)
-        # Tính khoảng cách trung bình đến hàng xóm/cụm
-        # Ta dùng cơ chế max_message cũ để đo độ "lạc lõng" của feature
-        # Lưu ý: feature cần được normalize trước
+        # 1. Base Score từ CARE (Affinity-based)
+        # Sử dụng lại logic của max_message để tính độ liên kết
         feature_norm = feature / torch.norm(feature, dim=-1, keepdim=True)
         
-        # Xác suất gán cụm
-        S = torch.sum(alpha, dim=1, keepdim=True)
-        prob_assign = alpha / S
+        # Trong CARE, message cao = normal, message thấp = anomaly
+        # Ta lấy âm của message để: cao = anomaly
+        _, message = self.max_message(feature, torch.mm(feature_norm, feature_norm.T)) 
+        base_score = 1 - message # Giả định message nằm trong khoảng [0,1]
         
-        # Cluster Affinity Matrix
-        # (Ở đây ta dùng lại logic cluster_sim như trong forward nhưng đơn giản hóa)
-        sim_matrix = torch.mm(feature_norm, feature_norm.T) 
-        
-        # 2. [S²E] Uncertainty Score
+        # 2. Uncertainty Score
         uncertainty = self.calc_uncertainty(alpha).squeeze()
         
-        # Kết hợp: Score gốc * Uncertainty
-        # (Score gốc ở đây xấp xỉ bằng norm của feature hoặc độ lệch)
-        # Để đơn giản và hiệu quả, ta dùng Norm của Feature gốc (Magnitude) làm base score
-        base_score = torch.norm(feature, dim=1)
-        
-        # Final Anomaly Score
-        # Node bất thường: Vừa có hành vi mạnh (base_score cao) vừa không chắc chắn (uncertainty cao)
-        final_score = base_score * (1 + uncertainty) 
+        # 3. Kết hợp: Base Score * (1 + Uncertainty)
+        # Node vừa có affinity thấp, vừa có uncertainty cao sẽ có score cao nhất
+        final_score = base_score * (1 + uncertainty)
         
         return final_score
 
