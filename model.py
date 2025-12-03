@@ -232,7 +232,7 @@ class Model(nn.Module):
         # Trả về 4 giá trị
         return feat, cluster_sim, total_loss, alpha
 
-    # 2. View Consistency (Đây là hàm bạn bị thiếu)
+    # 2. View Consistency (HÀM ĐÃ ĐƯỢC THÊM VÀO ĐÂY)
     def view_consistency(self, seq, adj1, adj2, sparse=False):
         """
         Tính độ lệch giữa 2 view (nếu có).
